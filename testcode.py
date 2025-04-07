@@ -11,7 +11,6 @@ from data import MultiClassFoodDetectionDataset, parse_annotation
 # 테스트 데이터셋 생성
 dataset = MultiClassFoodDetectionDataset(IMAGE_DIR, XML_BASE_DIR, MASK_BASE_DIR, target_size=TARGET_SIZE)
 
-
 # 한글 경로에서 이미지 읽기 함수
 def read_image_with_korean_path(img_path):
     # NumPy 파일로 읽고, OpenCV로 디코딩

@@ -274,7 +274,8 @@ def parse_annotation(xml_path, target_size=None, label_dict=None, mask_base_dir=
                 # 음식 코드를 클래스 라벨로 매핑
                 # 현재 폴더명으로 클래스 이름 결정
                 for class_name, class_id in label_dict.items():
-                    if class_name != 'dish' and name.startswith(class_name.split('.')[0]):
+                    class_code = class_name.split('.')[0] if '.' in class_name else class_name
+                    if name.startswith(class_code):
                         label = class_id
                         break
 
