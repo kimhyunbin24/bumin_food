@@ -114,6 +114,9 @@ def train_detection_model(model, train_loader, val_loader, device, num_epochs=10
     for epoch in range(num_epochs):
         print(f"Epoch {epoch}/{num_epochs - 1}")
 
+
+
+
         # 학습 모드
         model.train()
         train_loss = 0

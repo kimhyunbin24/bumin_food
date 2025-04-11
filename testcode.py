@@ -159,12 +159,14 @@ for idx in range(5):
     plt.imshow(mask, cmap='viridis')  # 마스크를 더 잘 볼 수 있도록 색상맵 변경
     plt.title(f"마스크 (값: {np.unique(mask)})")
 
+    # 3번째 서브플롯에서 원본 바운딩 박스 그리기
     plt.subplot(1, 3, 3)
     plt.imshow(img)
 
-    # parse_annotation으로 추출한 바운딩 박스 그리기
+    # parse_annotation으로 추출한 원본 바운딩 박스 그리기
     if len(boxes) > 0:
         for i, box in enumerate(boxes):
+            # 원본 좌표 그대로 사용 (스케일링 제거)
             x1, y1, x2, y2 = box.cpu().numpy().astype(int)
             label = labels[i].item() if i < len(labels) else 0
 

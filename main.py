@@ -6,286 +6,252 @@ from torch.utils.data import DataLoader, Subset
 from sklearn.model_selection import train_test_split
 from collections import Counter
 import cv2
+from PIL import Image
+import matplotlib.patches as patches
 
 # 커스텀 모듈 임포트
 from config import (
     IMAGE_DIR, XML_BASE_DIR, MASK_BASE_DIR, TARGET_SIZE, VOLUME_LABELS,
     choose_model_mode, enable_memory_growth, clear_memory
 )
-from data import MultiClassFoodDetectionDataset, custom_collate_fn
+from data import MultiClassFoodDetectionDataset, custom_collate_fn, parse_annotation
 from models import (
     get_detection_model, VolumeClassificationModel, load_pretrained_models,
     train_detection_model, train_volume_model
 )
 
 
-def visualize_comparison(image, gt_boxes, gt_labels, mask_path, pred_boxes, pred_labels, pred_masks, volume_labels,
-                         label_dict, idx=0):
+def visualize_from_paths(image_path, xml_path, mask_path, model, device, label_dict, save_path=None):
     """
-    원본, 그라운드 트루스 박스, 실제 마스크 파일, 예측 결과를 서브플롯으로 시각화
+    Load and visualize image, XML, and mask files using the model for prediction.
+    
+    Args:
+        image_path: Path to the image file
+        xml_path: Path to the XML file
+        mask_path: Path to the mask file
+        model: Model to use for prediction
+        device: Device to use (CPU or GPU)
+        label_dict: Class label mapping dictionary
+        save_path: Path to save visualization results (optional)
+    
+    Returns:
+        matplotlib Figure object
     """
-    # 4개의 서브플롯 생성
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-
-    # 이미지 정규화 해제를 위한 전처리
-    img_np = image.cpu().detach().numpy().transpose(1, 2, 0)
-    img_np = img_np * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
-    img_np = np.clip(img_np, 0, 1)
-
-    # 색상 매핑
-    class_colors = {
-        'dish': {'bbox': (255, 0, 0), 'mask': (0, 0, 255)},  # 파랑(마스크), 빨강(박스)
-        'food': {'bbox': (0, 255, 0), 'mask': (0, 255, 0)},  # 초록(마스크&박스)
-        'food_alt': {'bbox': (0, 200, 100), 'mask': (0, 200, 100)},  # 연두색(마스크&박스)
-        'default': {'bbox': (255, 255, 0), 'mask': (128, 128, 128)}  # 노랑(박스), 회색(마스크)
-    }
-
-    # 1. 원본 이미지
-    axes[0].imshow(img_np)
-    axes[0].set_title("원본 이미지")
-    axes[0].axis('off')
-
-    # 2. 원본 이미지 + 바운딩 박스 (그라운드 트루스)
-    axes[1].imshow(img_np)
-
-    # 바운딩 박스 그리기
-    for box, label in zip(gt_boxes.cpu().detach().numpy(), gt_labels.cpu().detach().numpy()):
-        xmin, ymin, xmax, ymax = map(int, box)
-
-        # 라벨명 찾기
-        label_name = next((k for k, v in label_dict.items() if v == label), 'Unknown')
-
-        # 박스 색상 선택
-        color = class_colors.get(label_name, class_colors['default'])['bbox']
-        color_normalized = tuple(c / 255 for c in color)
-
-        # 박스 그리기
-        rect = plt.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
-                             fill=False, edgecolor=color_normalized, linewidth=2)
-        axes[1].add_patch(rect)
-
-        # 라벨 텍스트 추가
-        axes[1].text(xmin, ymin - 10, label_name,
-                     color='white', fontsize=10,
-                     bbox=dict(facecolor=color_normalized, alpha=0.7))
-
-    axes[1].set_title("바운딩 박스 시각화")
-    axes[1].axis('off')
-
-    # 3. 마스크 시각화
-    try:
-        # 실제 마스크 파일 로드
-        mask_array = np.load(mask_path)
-
-        # 마스크가 이미지 크기와 다른 경우 리사이즈
-        if mask_array.shape[:2] != (img_np.shape[0], img_np.shape[1]):
-            mask_array = cv2.resize(mask_array, (img_np.shape[1], img_np.shape[0]),
-                                    interpolation=cv2.INTER_NEAREST)
-
-        # 마스크 시각화를 위한 배열 준비
-        mask_display = np.zeros_like(img_np)
-
-        # 음식 라벨을 우선순위로 시각화
-        unique_vals = np.unique(mask_array)
-        unique_vals = unique_vals[unique_vals > 0]
-        food_first = sorted(unique_vals, reverse=True)
-
-        for class_id in food_first:
-            if class_id > 0:
-                label_name = next((k for k, v in label_dict.items() if v == class_id), 'Unknown')
-                color = class_colors.get(label_name, class_colors['default'])['mask']
-                color_normalized = color / 255.0
-                mask_display[mask_array == class_id] = color_normalized
-
-        axes[2].imshow(mask_display)
-        axes[2].set_title("마스크만 시각화 (음식 우선)")
-        axes[2].axis('off')
-
-    except Exception as e:
-        print(f"마스크 로드 중 오류 발생: {e}")
-        axes[2].text(0.5, 0.5, "마스크 로드 실패",
-                     ha='center', va='center', transform=axes[2].transAxes,
-                     color='red', fontsize=12)
-
-    # 4. 원본 이미지 + 예측 결과
-    axes[3].imshow(img_np)
-
-    # 예측 박스 그리기
-    for j, (box, label) in enumerate(zip(pred_boxes.cpu().detach().numpy(), pred_labels.cpu().detach().numpy())):
-        xmin, ymin, xmax, ymax = map(int, box)
-
-        # 라벨명 찾기
-        label_name = next((k for k, v in label_dict.items() if v == label), 'Unknown')
-
-        # 박스 색상 선택
-        color = class_colors.get(label_name, class_colors['default'])['bbox']
-        color_normalized = tuple(c / 255 for c in color)
-
-        # 박스 그리기
-        rect = plt.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
-                             fill=False, edgecolor=color_normalized, linewidth=2)
-        axes[3].add_patch(rect)
-
-        # 마스크 그리기
-        mask = pred_masks[j]
-        mask_np = mask.squeeze().cpu().detach().numpy() > 0.5
-
-        # 마스크 오버레이
-        mask_viz = np.zeros_like(img_np)
-        mask_viz[mask_np] = [0.5, 0, 0.5]  # 보라색 마스크
-        axes[3].imshow(mask_viz, alpha=0.6)
-
-        # 음식 양 예측
-        from config import calculate_volume_class
-        volume_class = calculate_volume_class(mask_np)
-        vol_label = volume_labels[volume_class]
-
-        # 박스 위에 텍스트 표시
-        axes[3].text(xmin, ymin - 10, f"{label_name}\nVol: {vol_label}",
-                     color='white', fontsize=10,
-                     bbox=dict(facecolor=color_normalized, alpha=0.5))
-
-    axes[3].set_title("Predictions")
-    axes[3].axis('off')
-
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from PIL import Image
+    import torch
+    from data import parse_annotation
+    
+    # Load image
+    image = Image.open(image_path).convert('RGB')
+    image = np.array(image)
+    
+    # Extract bounding boxes and labels from XML file
+    boxes, labels, mask_path, size = parse_annotation(xml_path)
+    
+    # Load mask
+    mask = np.load(mask_path) if isinstance(mask_path, str) and os.path.exists(mask_path) else np.zeros_like(image[:, :, 0])
+    
+    # Resize image and mask
+    image = Image.fromarray(image).resize((224, 224))
+    mask = Image.fromarray(mask).resize((224, 224))
+    
+    # Convert image and mask to tensors
+    image = torch.from_numpy(np.array(image)).permute(2, 0, 1).float() / 255.0
+    mask = torch.from_numpy(np.array(mask)).unsqueeze(0).float()
+    
+    # Model prediction
+    model.eval()
+    with torch.no_grad():
+        prediction = model([image.to(device)])
+    
+    # Visualization
+    fig, axes = plt.subplots(2, 2, figsize=(15, 15))
+    
+    # Original image
+    axes[0, 0].imshow(image.permute(1, 2, 0).cpu().numpy())
+    axes[0, 0].set_title('Original Image')
+    axes[0, 0].axis('off')
+    
+    # Ground truth bounding boxes
+    axes[0, 1].imshow(image.permute(1, 2, 0).cpu().numpy())
+    for box, label in zip(boxes, labels):
+        x1, y1, x2, y2 = box
+        class_name = next((k for k, v in label_dict.items() if v == label), "Unknown")
+        axes[0, 1].add_patch(plt.Rectangle((x1, y1), x2-x1, y2-y1, fill=False, color='red'))
+        axes[0, 1].text(x1, y1, f'{class_name}', color='red')
+    axes[0, 1].set_title('Ground Truth Boxes')
+    axes[0, 1].axis('off')
+    
+    # Ground truth mask
+    axes[1, 0].imshow(mask.squeeze().cpu().numpy(), cmap='gray')
+    axes[1, 0].set_title('Ground Truth Mask')
+    axes[1, 0].axis('off')
+    
+    # Prediction results
+    axes[1, 1].imshow(image.permute(1, 2, 0).cpu().numpy())
+    for box, label, score in zip(prediction[0]['boxes'], prediction[0]['labels'], prediction[0]['scores']):
+        if score > 0.5:  # Confidence threshold
+            x1, y1, x2, y2 = box.cpu().numpy()
+            class_name = next((k for k, v in label_dict.items() if v == label.item()), "Unknown")
+            axes[1, 1].add_patch(plt.Rectangle((x1, y1), x2-x1, y2-y1, fill=False, color='blue'))
+            axes[1, 1].text(x1, y1, f'{class_name} ({score:.2f})', color='blue')
+    axes[1, 1].set_title('Predictions')
+    axes[1, 1].axis('off')
+    
     plt.tight_layout()
-    return fig  # 상위 함수에서 plt.show() 호출
+    
+    # Save results
+    if save_path:
+        plt.savefig(save_path)
+    
+    return fig
 
 
 def test_integrated_models(detection_model, volume_model, val_loader, device, label_dict, dataset, val_indices):
     """
-    통합 모델 테스트 및 시각화 함수
-
-    Args:
-        detection_model: 음식 탐지 모델
-        volume_model: 음식 양 분류 모델
-        val_loader: 검증 데이터 로더
-        device: 테스트에 사용할 장치 (CPU/GPU)
-        label_dict: 클래스 라벨 매핑 딕셔너리
-        dataset: 전체 데이터셋
-        val_indices: 검증 데이터셋 인덱스
+    Test and visualize integrated models
     """
-    import cv2
-
     detection_model.eval()
     volume_model.eval()
 
-    # 클래스별 샘플 수집을 위한 딕셔너리
+    # Dictionary for collecting samples by class
     class_samples = {}
     class_targets = {}
 
-    # 클래스별로 보여줄 샘플 수
+    # Number of samples to show per class
     samples_per_class = 4
 
-    print("각 클래스별 시각화 샘플 수집 중...")
+    print("Collecting visualization samples for each class...")
 
-    # 1. 각 클래스별 샘플 수집
+    # 1. Collect samples for each class
     with torch.no_grad():
         for batch_idx, (images, targets) in enumerate(val_loader):
             for i, target in enumerate(targets):
-                # 현재 배치의 인덱스를 전체 val_indices 인덱스로 변환
+                # Convert current batch index to overall val_indices index
                 dataset_idx = batch_idx * val_loader.batch_size + i
-                if dataset_idx >= len(val_indices):  # 마지막 배치 처리
+                if dataset_idx >= len(val_indices):  # Handle last batch
                     continue
 
-                # 원본 데이터셋의 클래스 라벨 사용
+                # Use original dataset class labels
                 class_id = dataset.class_labels[val_indices[dataset_idx]]
 
-                # 딕셔너리 초기화 (없는 경우)
+                # Initialize dictionary (if not exists)
                 if class_id not in class_samples:
                     class_samples[class_id] = []
                     class_targets[class_id] = []
 
-                # 해당 클래스의 샘플이 아직 충분하지 않으면 추가
+                # Add sample if not enough samples collected for this class
                 if len(class_samples[class_id]) < samples_per_class:
                     class_samples[class_id].append(images[i])
                     class_targets[class_id].append(target)
 
-    # 2. 클래스별로 순차적으로 시각화
+    # 2. Visualize all samples at once
+    all_samples = []
+    all_targets = []
+    all_class_ids = []
+
     for class_id in sorted(class_samples.keys()):
         samples = class_samples[class_id]
         sample_targets = class_targets[class_id]
 
         if len(samples) == 0:
-            print(f"클래스 {class_id}에 대한 샘플이 없습니다.")
+            print(f"No samples found for class {class_id}.")
             continue
 
         class_name = next((name for name, idx in label_dict.items() if idx == class_id), "Unknown")
-        print(f"\n===== 클래스 {class_id} ({class_name}) 시각화 중... =====")
-        print(f"수집된 샘플 수: {len(samples)}")
+        print(f"Collected {len(samples)} samples for class {class_id} ({class_name}).")
 
-        # 각 샘플에 대해 시각화
-        for idx, (image, target) in enumerate(zip(samples, sample_targets)):
-            # GPU로 이동
-            image = image.to(device)
+        all_samples.extend(samples)
+        all_targets.extend(sample_targets)
+        all_class_ids.extend([class_id] * len(samples))
 
-            # 객체 탐지 수행
-            detection = detection_model([image])[0]
+    # Create a figure with subplots
+    num_samples = len(all_samples)
+    num_rows = (num_samples + 1) // 2
+    fig, axes = plt.subplots(num_rows, 2, figsize=(15, 5 * num_rows))
+    axes = axes.flatten()
 
-            # 예측 결과 필터링
-            boxes = detection['boxes']
-            scores = detection['scores']
-            masks = detection['masks']
-            labels = detection['labels']
+    # Visualize each sample
+    for idx, (image, target, class_id) in enumerate(zip(all_samples, all_targets, all_class_ids)):
+        if idx >= len(axes):
+            break
 
-            # 디버깅: 탐지된 객체 정보 출력
-            print(f"샘플 {idx + 1}: 신뢰도 > 0.1인 객체 수: {torch.sum(scores > 0.1).item()}")
+        # Move to GPU
+        image = image.to(device)
 
-            # 신뢰도 임계값 적용 (더 낮은 임계값 0.1 사용)
-            valid_idx = scores >= 0.1
-            pred_boxes = boxes[valid_idx]
-            pred_masks = masks[valid_idx]
-            pred_labels = labels[valid_idx]
+        # Perform object detection
+        detection = detection_model([image])[0]
 
-            # 그라운드 트루스 정보
-            gt_boxes = target['boxes']
-            gt_labels = target['labels']
-            mask_path = target['mask_path']
+        # Filter prediction results
+        boxes = detection['boxes']
+        scores = detection['scores']
+        masks = detection['masks']
+        labels = detection['labels']
 
-            # 시각화 수행
-            fig = visualize_comparison(
-                image,
-                gt_boxes,
-                gt_labels,
-                mask_path,
-                pred_boxes,
-                pred_labels,
-                pred_masks,
-                VOLUME_LABELS,
-                label_dict,
-                idx=idx
-            )
+        # Debug: Print detected object information
+        print(f"Sample {idx + 1}: Number of objects with confidence > 0.1: {torch.sum(scores > 0.1).item()}")
 
-            plt.suptitle(f"클래스 {class_id} ({class_name}) - 샘플 {idx + 1}/{len(samples)}", fontsize=16)
-            plt.tight_layout()
+        # Apply confidence threshold (using lower threshold 0.1)
+        valid_idx = scores >= 0.1
+        pred_boxes = boxes[valid_idx]
+        pred_masks = masks[valid_idx]
+        pred_labels = labels[valid_idx]
 
-            # 사용자가 창을 닫을 때까지 대기
-            print(f"창을 닫으면 다음 샘플로 넘어갑니다. (샘플 {idx + 1}/{len(samples)})")
-            plt.show(block=True)  # block=True로 설정하여 사용자가 창을 닫을 때까지 대기
+        # Ground truth information
+        gt_boxes = target['boxes']
+        gt_labels = target['labels']
+        mask_path = target['mask_path']
 
-        print(f"클래스 {class_id} ({class_name}) 시각화 완료")
+        # Food volume classification model prediction
+        volume_class = None
+        if volume_model is not None:
+            volume_outputs = volume_model(image.unsqueeze(0))
+            volume_class = torch.argmax(volume_outputs).item()
 
-    print("\n모든 클래스 시각화 완료")
+        # Perform visualization using new function
+        fig = visualize_from_paths(
+            dataset.image_files[val_indices[dataset_idx]],  # Pass image path
+            dataset.xml_files[val_indices[dataset_idx]],  # Pass XML file path
+            target['mask_path'],
+            detection_model,
+            device,
+            label_dict
+        )
+
+        class_name = next((name for name, idx in label_dict.items() if idx == class_id), "Unknown")
+        axes[idx].set_title(f"Class {class_id} ({class_name}) - Sample {idx + 1}/{num_samples}")
+        axes[idx].axis('off')
+
+    # Hide empty subplots
+    for idx in range(num_samples, len(axes)):
+        axes[idx].axis('off')
+
+    plt.tight_layout()
+    plt.show(block=True)
+
+    print("\nVisualization completed for all classes.")
 
 
 def main():
     """
-    메인 실행 함수
+    Main execution function
     """
-    # GPU 성능 개선을 위한 추가 설정
+    # GPU performance improvement settings
     torch.backends.cudnn.benchmark = True
 
-    # 디버깅 도구 설정: CUDA 에러를 더 명확하게 보기 위함
+    # Debugging tool settings: To see CUDA errors more clearly
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
-    # 메모리 동적 할당 활성화
+    # Enable dynamic memory allocation
     enable_memory_growth()
 
-    # 데이터셋 생성 (최적화된 파일 매칭 및 라벨 인덱스 수정)
+    # Create dataset (optimized file matching and label index modification)
     dataset = MultiClassFoodDetectionDataset(IMAGE_DIR, XML_BASE_DIR, MASK_BASE_DIR, target_size=TARGET_SIZE)
 
-    print("\n데이터셋 상세 정보:")
-    for idx in range(min(5, len(dataset))):  # 처음 5개 항목만 출력
+    print("\nDataset details:")
+    for idx in range(min(5, len(dataset))):  # Only output first 5 items
         img, target = dataset[idx]
         print(f"Dataset Item {idx}:")
         print(f"  Boxes: {target['boxes']}")
@@ -294,14 +260,14 @@ def main():
         print(f"  Volume Class: {target['volume_class']}")
 
     num_classes = len(dataset.label_dict)
-    print(f"탐지된 클래스 수: {num_classes}")
-    print(f"클래스 매핑: {dataset.label_dict}")
+    print(f"Number of detected classes: {num_classes}")
+    print(f"Class mapping: {dataset.label_dict}")
 
-    # Stratified sampling을 사용하여 데이터셋 분할
+    # Split dataset using Stratified sampling
     train_indices, val_indices = train_test_split(
         list(range(len(dataset))),
         test_size=0.2,
-        stratify=dataset.class_labels  # 클래스 라벨을 기준으로 계층화 sampling
+        stratify=dataset.class_labels  # Stratified sampling based on class labels
     )
 
     train_dataset = Subset(dataset, train_indices)
@@ -309,10 +275,10 @@ def main():
 
     val_class_labels = [dataset.class_labels[i] for i in val_indices]
     val_class_counts = Counter(val_class_labels)
-    print("\n검증 데이터셋 클래스별 개수:")
+    print("\nValidation dataset class counts:")
     for class_id, count in val_class_counts.items():
         class_name = next((name for name, idx in dataset.label_dict.items() if idx == class_id), "Unknown")
-        print(f"클래스 {class_id} ({class_name}): {count}개")
+        print(f"Class {class_id} ({class_name}): {count} items")
 
     train_loader = DataLoader(
         train_dataset,
@@ -332,38 +298,162 @@ def main():
         pin_memory=True
     )
 
-    # 디바이스 설정
+    # Device setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 모델 모드 선택
+    # Model mode selection
     mode_choice = choose_model_mode()
 
     if mode_choice == 1:
-        # 저장된 가중치 로드
+        # Load saved weights
         detection_model, volume_model = load_pretrained_models(num_classes, device)
 
         if detection_model is None or volume_model is None:
-            print("모델 가중치 로드 실패. 새로운 모델을 학습합니다.")
-            # 모델 초기화 (클래스 수를 정확히 지정)
+            print("Failed to load model weights. Training new models.")
+            # Initialize models (specify exact number of classes)
             detection_model = get_detection_model(num_classes=num_classes).to(device)
             volume_model = VolumeClassificationModel(num_classes=4).to(device)
     else:
-        # 1. 음식 탐지 모델 훈련
-        print("\n----- 1단계: 음식 탐지 모델 훈련 -----")
+        # 1. Train food detection model
+        print("\n----- Step 1: Training food detection model -----")
         detection_model = get_detection_model(num_classes=num_classes).to(device)
         train_detection_model(detection_model, train_loader, val_loader, device, num_epochs=1)
 
-        # 2. 음식 양 분류 모델 훈련
-        print("\n----- 2단계: 음식 양 분류 모델 훈련 -----")
+        # 2. Train food volume classification model
+        print("\n----- Step 2: Training food volume classification model -----")
         volume_model = VolumeClassificationModel(num_classes=4).to(device)
         train_volume_model(volume_model, train_loader, val_loader, device, num_epochs=1)
 
-    print("모델 준비 완료!")
+    print("Models ready!")
 
-    # 3. 최종 모델 테스트 (클래스별 순차적 시각화)
-    print("\n----- 클래스별 순차적 시각화 -----")
+    # 3. Final model testing (sequential visualization by class)
+    print("\n----- Sequential visualization by class -----")
     test_integrated_models(detection_model, volume_model, val_loader, device, dataset.label_dict, dataset, val_indices)
+    
+    # 4. Visualize random images from the specified directory
+    print("\n----- Visualizing random images from the specified directory -----")
+    visualize_random_images_from_directory(
+        "C:\\Users\\furim\\Desktop\\Bumin_dataset\\202306\\전영숙_F76_45",
+        detection_model,
+        volume_model,
+        device,
+        dataset.label_dict,
+        num_images=4
+    )
+
+    # 데이터셋 검증
+    print("\n=== 학습 데이터셋 검증 ===")
+    train_class_counts, train_xml_counts, train_folder_counts = validate_dataset(train_dataset)
+    
+    print("\n=== 검증 데이터셋 검증 ===")
+    val_class_counts, val_xml_counts, val_folder_counts = validate_dataset(val_dataset)
+
+
+def visualize_random_images_from_directory(directory_path, detection_model, volume_model, device, label_dict, num_images=4):
+    """
+    Visualize random images from the specified directory
+    
+    Args:
+        directory_path: Path to the directory containing images
+        detection_model: Detection model to use
+        volume_model: Volume classification model to use
+        device: Device to use (CPU or GPU)
+        label_dict: Class label mapping dictionary
+        num_images: Number of images to visualize
+    """
+    import os
+    import random
+    from PIL import Image
+    import torch
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    # Get list of image files in the directory
+    image_files = [f for f in os.listdir(directory_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    
+    if not image_files:
+        print(f"No image files found in {directory_path}")
+        return
+    
+    # Randomly select images
+    selected_images = random.sample(image_files, min(num_images, len(image_files)))
+    
+    print(f"Selected {len(selected_images)} images for visualization")
+    
+    # Create a figure with subplots
+    fig, axes = plt.subplots(2, 2, figsize=(15, 15))
+    axes = axes.flatten()
+    
+    # Process each selected image
+    for idx, image_file in enumerate(selected_images):
+        if idx >= len(axes):
+            break
+            
+        image_path = os.path.join(directory_path, image_file)
+        
+        # Load and preprocess image
+        image = Image.open(image_path).convert('RGB')
+        image_np = np.array(image)
+        
+        # Resize image
+        image = image.resize((224, 224))
+        
+        # Convert to tensor
+        image_tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1).float() / 255.0
+        image_tensor = image_tensor.unsqueeze(0).to(device)
+        
+        # Perform object detection
+        detection_model.eval()
+        with torch.no_grad():
+            detection = detection_model([image_tensor])[0]
+        
+        # Filter prediction results
+        boxes = detection['boxes']
+        scores = detection['scores']
+        labels = detection['labels']
+        
+        # Apply confidence threshold
+        valid_idx = scores >= 0.5
+        pred_boxes = boxes[valid_idx]
+        pred_labels = labels[valid_idx]
+        pred_scores = scores[valid_idx]
+        
+        # Perform volume classification
+        volume_class = None
+        if volume_model is not None:
+            volume_model.eval()
+            with torch.no_grad():
+                volume_outputs = volume_model(image_tensor)
+                volume_class = torch.argmax(volume_outputs).item()
+        
+        # Visualize
+        axes[idx].imshow(image_np)
+        
+        # Draw bounding boxes
+        for box, label, score in zip(pred_boxes, pred_labels, pred_scores):
+            x1, y1, x2, y2 = box.cpu().numpy()
+            class_name = next((k for k, v in label_dict.items() if v == label.item()), "Unknown")
+            axes[idx].add_patch(plt.Rectangle((x1, y1), x2-x1, y2-y1, fill=False, color='blue'))
+            axes[idx].text(x1, y1, f'{class_name} ({score:.2f})', color='blue')
+        
+        # Add volume information if available
+        if volume_class is not None:
+            volume_text = f"Volume: {volume_class}"
+            axes[idx].text(10, 10, volume_text, color='white', fontsize=10, 
+                          bbox=dict(facecolor='black', alpha=0.7))
+        
+        axes[idx].set_title(f'Image {idx+1}: {image_file}')
+        axes[idx].axis('off')
+    
+    # Hide empty subplots
+    for idx in range(len(selected_images), len(axes)):
+        axes[idx].axis('off')
+    
+    plt.tight_layout()
+    plt.show(block=True)
+    
+    print("Random image visualization completed")
 
 
 if __name__ == "__main__":

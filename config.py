@@ -20,6 +20,24 @@ TARGET_SIZE = (224, 224)
 VOLUME_LABELS = ['0-25%', '25-50%', '50-75%', '75-100%']
 
 
+def create_label_dict(base_dir):
+    label_dict = {
+        'background': 0,
+        'dish': 1
+    }
+
+    # 숫자로 시작하는 폴더 찾기
+    food_dirs = [d for d in os.listdir(base_dir)
+                 if os.path.isdir(os.path.join(base_dir, d))
+                 and d[0].isdigit()]
+
+    # 폴더 이름으로 라벨 생성
+    for idx, dir_name in enumerate(sorted(food_dirs), start=2):
+        label_dict[dir_name] = idx
+
+    return label_dict
+
+
 def choose_model_mode():
     """
     모델 실행 모드 선택 함수
